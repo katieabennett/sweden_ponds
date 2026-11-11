@@ -1,0 +1,89 @@
+---
+title: "HOBO logger processing"
+author: "Kathryn Bennett"
+date: "2026-11-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(dplyr)
+library(lubridate)
+library(stringr)
+```
+
+Set folder directory, import and trim files
+```{r}
+in_dir  <- "raw_data/HOBO_loggerdat"
+out_dir <- "processed_data"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+ 
+files <- list.files(in_dir, pattern = "\\.csv$", full.names = TRUE, ignore.case = TRUE)
+if (length(files) == 0) stop("No .csv files found in ", in_dir)
+ 
+read_logger_file <- function(path) {
+  # pond_field_id and sensor_location come from the file name,
+  # e.g. Thaw_Pond_A_Bottom_aug.csv -> A, Bottom
+  m <- str_match(basename(path), "Pond_([A-Z])_(Bottom|Surface)")
+  if (any(is.na(m))) stop("File name does not match expected pattern: ", basename(path))
+ 
+  # Line 1 = plot title, line 2 = header; data starts on line 3.
+  # Columns: 2 = date/time, 3 = temperature (the header names contain logger
+  # serial numbers, so select by position instead of by name).
+  raw <- read_csv(
+    path,
+    skip = 2, col_names = FALSE, col_select = c(2, 3),
+    col_types = cols(.default = col_character()),
+    progress = FALSE
+  )
+  names(raw) <- c("datetime_raw", "temp_raw")
+ 
+  dat <- raw %>%
+    mutate(
+      # kept in logger local time as recorded (tz label "UTC" only avoids DST shifts)
+      datetime = parse_date_time(datetime_raw, orders = "mdy IMS p", tz = "UTC"),
+      temp     = suppressWarnings(as.numeric(temp_raw))
+    ) %>%
+    filter(!is.na(temp))   # drops logger event rows (coupler, host connected, stopped, etc.)
+ 
+  if (anyNA(dat$datetime)) warning("Unparsed datetimes in ", basename(path))
+ 
+  # Cut first and last hour of valid data
+  t_start <- min(dat$datetime)
+  t_end   <- max(dat$datetime)
+  dat <- dat %>%
+    filter(datetime >= t_start + hours(1), datetime <= t_end - hours(1))
+ 
+  dat %>%
+    transmute(
+      pond_field_id   = m[2],
+      sensor_location = m[3],
+      datetime,
+      temp
+    )
+}
+```
+
+ Combine all files
+```{r}
+all_data <- bind_rows(lapply(files, read_logger_file)) %>%
+  arrange(pond_field_id, sensor_location, datetime)
+ 
+write_csv(all_data, file.path(out_dir, "pond_temperature_2018-19_all.csv"))
+
+```
+
+Daily mean by pond, combining Surface and Bottom sensors
+```{r}
+daily <- all_data %>%
+  mutate(date = as_date(datetime)) %>%
+  group_by(pond_field_id, date) %>%
+  summarise(
+    temp_avg = round(mean(temp), 1),
+    temp_sd  = round(sd(temp), 1),
+    .groups = "drop"
+  )
+ 
+write_csv(daily, file.path(out_dir, "pond_temperature_2018-19_daily.csv"))
+```
